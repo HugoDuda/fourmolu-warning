@@ -1,0 +1,117 @@
+{
+  "name": "fourmolu-warning",
+  "displayName": "Fourmolu Warning",
+  "description": "Reports Haskell files that do not pass the Fourmolu check.",
+  "version": "0.2.0",
+  "publisher": "hugoduda",
+  "author": {
+    "name": "Hugo Duda"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HugoDuda/fourmolu-warning.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HugoDuda/fourmolu-warning/issues"
+  },
+  "homepage": "https://github.com/HugoDuda/fourmolu-warning#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Formatters"
+  ],
+  "keywords": [
+    "fourmolu",
+    "haskell",
+    "formatter"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onLanguage:haskell",
+    "onCommand:fourmoluWarning.checkCurrentFile",
+    "onCommand:fourmoluWarning.formatCurrentFile"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "fourmoluWarning.checkCurrentFile",
+        "title": "Fourmolu: Check Current File"
+      },
+      {
+        "command": "fourmoluWarning.formatCurrentFile",
+        "title": "Fourmolu: Format Current File"
+      }
+    ],
+    "configuration": {
+      "title": "Fourmolu Warning",
+      "properties": {
+        "fourmoluWarning.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Enable Fourmolu formatting diagnostics."
+        },
+        "fourmoluWarning.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Check matching Haskell files after they are saved."
+        },
+        "fourmoluWarning.executablePath": {
+          "type": "string",
+          "default": "fourmolu",
+          "scope": "resource",
+          "description": "Fourmolu executable name or path. Relative paths are resolved from the workspace folder."
+        },
+        "fourmoluWarning.include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/*.hs"
+          ],
+          "scope": "resource",
+          "description": "Glob patterns, relative to each workspace folder, for files to check."
+        },
+        "fourmoluWarning.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/dist-newstyle/**",
+            "**/.stack-work/**"
+          ],
+          "scope": "resource",
+          "description": "Glob patterns, relative to each workspace folder, for files to ignore."
+        },
+        "fourmoluWarning.extraArguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "description": "Additional arguments passed to Fourmolu before its mode and file arguments."
+        }
+      }
+    }
+  }
+}
