@@ -2,7 +2,7 @@
 
 ## 0.3.1
 
-Update README.md to reflect the new version of Fourmolu.
+- Update README.md to reflect the new version of Fourmolu.
 
 ## 0.3.0
 
