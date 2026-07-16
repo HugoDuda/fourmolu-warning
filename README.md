@@ -12,6 +12,20 @@ check, without modifying them automatically.
 - supports additional Fourmolu arguments and a custom executable path;
 - distinguishes formatting differences from Fourmolu parser or execution errors.
 
+## Examples
+
+### Import ordering
+
+![Fourmolu warning for reordered imports](./images/example1.png)
+
+### Documentation formatting
+
+![Fourmolu warning for documentation](./images/example2.png)
+
+### Generic formatting warning
+
+![Fourmolu warning on a Haskell block](./images/example3.png)
+
 ## Requirements
 
 Install `fourmolu` in the environment where the extension runs. For remote SSH,
