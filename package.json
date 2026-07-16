@@ -2,7 +2,7 @@
   "name": "fourmolu-warning",
   "displayName": "Fourmolu Warning",
   "description": "Reports Haskell files that do not pass the Fourmolu check.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "hugoduda",
   "author": {
     "name": "Hugo Duda"

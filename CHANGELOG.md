@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+Update README.md to reflect the new version of Fourmolu.
+
 ## 0.3.0
 
 - report Fourmolu formatting differences on their affected source blocks.
