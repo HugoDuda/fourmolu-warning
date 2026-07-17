@@ -401,6 +401,54 @@ test("reports one diagnostic spanning a multi-line Fourmolu formatting block", a
   });
 });
 
+test("labels blocks where Fourmolu removes only extra spaces", async () => {
+  reset();
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: args.includes("check")
+      ? ""
+      : "module Example where\n\nvalue = 1\n",
+    stderr: "",
+  });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "ExtraSpaces.hs"),
+    "module Example where\n\nvalue  =  1\n",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  const [diagnostic] = diagnosticsByUri.get(document.uri.toString());
+  assert.equal(
+    diagnostic.message,
+    "This block contains extra spaces that Fourmolu removes.",
+  );
+});
+
+test("labels blocks where Fourmolu removes only extra blank lines", async () => {
+  reset();
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: args.includes("check")
+      ? ""
+      : "module Example where\n\nfirst = 1\n\nsecond = 2\n",
+    stderr: "",
+  });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "ExtraBlankLines.hs"),
+    "module Example where\n\nfirst = 1\n\n\nsecond = 2\n",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  const [diagnostic] = diagnosticsByUri.get(document.uri.toString());
+  assert.equal(
+    diagnostic.message,
+    "This block contains extra blank lines that Fourmolu removes.",
+  );
+});
+
 test("reports reordered imports as one block with their formatted output", async () => {
   reset();
   const source = [

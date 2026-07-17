@@ -16,6 +16,9 @@ const FORMATTING_MESSAGES = {
     "This import block must be reordered to match the configured Fourmolu import order.",
   moduleDocumentation:
     "This module documentation does not match the configured Fourmolu Haddock style.",
+  extraSpaces: "This block contains extra spaces that Fourmolu removes.",
+  extraBlankLines:
+    "This block contains extra blank lines that Fourmolu removes.",
   generic: "This Haskell block does not match the configured Fourmolu format.",
 };
 
@@ -428,6 +431,7 @@ function runFourmolu(executable, args, cwd) {
 
 function setFormattingDiagnostics(document, formattedText) {
   const sourceText = document.getText();
+  const sourceLines = splitLines(sourceText);
   const formattedLines = splitLines(formattedText);
   let blocks = changedLineBlocks(sourceText, formattedText);
 
@@ -444,10 +448,18 @@ function setFormattingDiagnostics(document, formattedText) {
   }
 
   const entries = blocks.map((block) => {
-    const formattedBlock = formattedBlockText(formattedLines, block);
-    const kind = block.kind || (
-      isCommentOutput(formattedBlock) ? "moduleDocumentation" : undefined
+    const sourceBlockLines = blockLines(
+      sourceLines,
+      block.startLine,
+      block.endLine,
     );
+    const formattedBlockLines = blockLines(
+      formattedLines,
+      block.formattedStartLine,
+      block.formattedEndLine,
+    );
+    const formattedBlock = formattedBlockLines.join("\n");
+    const kind = formattingKind(block, sourceBlockLines, formattedBlockLines);
     return {
       range: diagnosticRange(document, block),
       formattedText: formattedBlock,
@@ -468,6 +480,48 @@ function setFormattingDiagnostics(document, formattedText) {
       ),
     ),
   );
+}
+
+function formattingKind(block, sourceLines, formattedLines) {
+  if (block.kind) {
+    return block.kind;
+  }
+  const sourceBlock = sourceLines.join("\n");
+  const formattedBlock = formattedLines.join("\n");
+  if (isCommentOutput(sourceBlock) || isCommentOutput(formattedBlock)) {
+    return "moduleDocumentation";
+  }
+  if (removesOnlyBlankLines(sourceLines, formattedLines)) {
+    return "extraBlankLines";
+  }
+  if (removesOnlySpaces(sourceLines, formattedLines)) {
+    return "extraSpaces";
+  }
+  return undefined;
+}
+
+function removesOnlyBlankLines(sourceLines, formattedLines) {
+  const sourceContent = sourceLines.filter((line) => line.trim() !== "");
+  const formattedContent = formattedLines.filter((line) => line.trim() !== "");
+  return (
+    sourceLines.length > sourceContent.length &&
+    sourceLines.length > formattedLines.length &&
+    sourceContent.join("\n") === formattedContent.join("\n")
+  );
+}
+
+function removesOnlySpaces(sourceLines, formattedLines) {
+  const sourceBlock = sourceLines.join("\n");
+  const formattedBlock = formattedLines.join("\n");
+  return (
+    sourceLines.length === formattedLines.length &&
+    sourceBlock.replace(/[ \t]/g, "") === formattedBlock.replace(/[ \t]/g, "") &&
+    horizontalWhitespaceCount(sourceBlock) > horizontalWhitespaceCount(formattedBlock)
+  );
+}
+
+function horizontalWhitespaceCount(value) {
+  return (value.match(/[ \t]/g) || []).length;
 }
 
 function formattingMessage(kind) {
@@ -588,13 +642,11 @@ function changedLineBlocks(sourceText, formattedText) {
   );
 }
 
-function formattedBlockText(formattedLines, block) {
-  if (block.formattedEndLine < block.formattedStartLine) {
-    return "";
+function blockLines(lines, startLine, endLine) {
+  if (endLine < startLine) {
+    return [];
   }
-  return formattedLines
-    .slice(block.formattedStartLine, block.formattedEndLine + 1)
-    .join("\n");
+  return lines.slice(startLine, endLine + 1);
 }
 
 function mergeImportBlocks(blocks, sourceLines, formattedLines) {

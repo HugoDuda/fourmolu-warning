@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+- add dedicated diagnostics when Fourmolu removes extra spaces or blank lines.
+
 ## 0.4.0
 
 - rename the extension to Fourmolu Checker;

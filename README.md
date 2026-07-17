@@ -18,6 +18,7 @@ Fourmolu Checker is useful when you want to:
 
 * checks saved `.hs` files, plus clean files when they are opened while automatic checking is enabled;
 * reports each affected Fourmolu formatting block in the Problems panel;
+* identifies reordered imports, Haddock documentation, extra spaces and extra blank lines when those are the only formatting change in a block;
 * shows the corresponding formatted block when hovering a formatting diagnostic;
 * provides a preferred quick fix to apply Fourmolu formatting;
 * supports standalone files, simple workspaces and multi-root workspaces;
