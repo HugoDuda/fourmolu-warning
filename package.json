@@ -2,7 +2,7 @@
   "name": "fourmolu-checker",
   "displayName": "Fourmolu Checker - Formatting Diagnostics for Haskell",
   "description": "Displays Fourmolu formatting differences as VS Code diagnostics without modifying your source files.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "hugoduda",
   "author": {
     "name": "Hugo Duda"
