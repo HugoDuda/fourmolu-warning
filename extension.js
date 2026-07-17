@@ -4,11 +4,13 @@ const childProcess = require("child_process");
 const path = require("path");
 const vscode = require("vscode");
 
-const SOURCE = "fourmolu-warning";
-const CHECK_COMMAND = "fourmoluWarning.checkCurrentFile";
-const FORMAT_COMMAND = "fourmoluWarning.formatCurrentFile";
+const SOURCE = "fourmolu-checker";
+const CHECK_COMMAND = "fourmoluChecker.checkCurrentFile";
+const FORMAT_COMMAND = "fourmoluChecker.formatCurrentFile";
 const CHECK_DELAY_MS = 250;
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_LOG_BYTES = 16 * 1024;
+const OUTPUT_CHANNEL_NAME = "Fourmolu Checker";
 const FORMATTING_MESSAGES = {
   importsReordered:
     "This import block must be reordered to match the configured Fourmolu import order.",
@@ -19,14 +21,16 @@ const FORMATTING_MESSAGES = {
 
 let diagnostics;
 let output;
+let active = false;
 const generations = new Map();
 const pendingChecks = new Map();
 const reportedToolFailures = new Map();
 const formattingHovers = new Map();
 
 function activate(context) {
+  active = true;
   diagnostics = vscode.languages.createDiagnosticCollection(SOURCE);
-  output = vscode.window.createOutputChannel("Fourmolu Warning");
+  output = vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
 
   context.subscriptions.push(
     diagnostics,
@@ -40,38 +44,43 @@ function activate(context) {
       scheduleSavedDocument(document);
     }),
     vscode.workspace.onDidChangeTextDocument(({ document }) => {
+      cancelScheduledCheck(document.uri);
       invalidate(document.uri);
       diagnostics.delete(document.uri);
       formattingHovers.delete(document.uri.toString());
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       cancelScheduledCheck(document.uri);
+      invalidate(document.uri);
       generations.delete(document.uri.toString());
       diagnostics.delete(document.uri);
       formattingHovers.delete(document.uri.toString());
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (!event.affectsConfiguration("fourmoluWarning")) {
+      if (!event.affectsConfiguration("fourmoluChecker")) {
         return;
       }
 
       diagnostics.clear();
       formattingHovers.clear();
+      reportedToolFailures.clear();
       for (const document of vscode.workspace.textDocuments) {
+        cancelScheduledCheck(document.uri);
+        invalidate(document.uri);
         if (!document.isDirty) {
-          scheduleCheck(document);
+          scheduleSavedDocument(document);
         }
       }
     }),
     vscode.commands.registerCommand(CHECK_COMMAND, checkCurrentFile),
     vscode.commands.registerCommand(FORMAT_COMMAND, formatCurrentFile),
     vscode.languages.registerCodeActionsProvider(
-      { scheme: "file", pattern: "**/*.hs" },
+      { language: "haskell" },
       new FourmoluQuickFixProvider(),
       { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
     ),
     vscode.languages.registerHoverProvider(
-      { scheme: "file", pattern: "**/*.hs" },
+      { language: "haskell" },
       new FourmoluHoverProvider(),
     ),
   );
@@ -82,11 +91,15 @@ function activate(context) {
 }
 
 function deactivate() {
+  active = false;
   for (const timeout of pendingChecks.values()) {
     clearTimeout(timeout);
   }
   pendingChecks.clear();
+  generations.clear();
+  reportedToolFailures.clear();
   formattingHovers.clear();
+  diagnostics?.clear();
 }
 
 class FourmoluQuickFixProvider {
@@ -132,7 +145,7 @@ class FourmoluHoverProvider {
 
 function setting(document, name, fallback) {
   return vscode.workspace
-    .getConfiguration("fourmoluWarning", document.uri)
+    .getConfiguration("fourmoluChecker", document.uri)
     .get(name, fallback);
 }
 
@@ -147,7 +160,7 @@ function scheduleCheck(document) {
 }
 
 function scheduleSavedDocument(document) {
-  if (!document.isDirty) {
+  if (!document.isDirty && setting(document, "checkOnSave", true)) {
     scheduleCheck(document);
   }
 }
@@ -169,7 +182,7 @@ function invalidate(uri) {
 }
 
 function isCurrent(uri, generation) {
-  return generations.get(uri.toString()) === generation;
+  return active && generations.get(uri.toString()) === generation;
 }
 
 async function checkCurrentFile(uri) {
@@ -193,36 +206,44 @@ async function formatCurrentFile(uri) {
   if (!document) {
     return;
   }
-  const context = workspaceContext(document);
-  if (!context) {
-    return;
-  }
   if (document.isDirty && !(await document.save())) {
     void vscode.window.showWarningMessage(
       "Fourmolu formatting cancelled because the file could not be saved.",
     );
     return;
   }
+  const context = workspaceContext(document);
+  if (!context) {
+    return;
+  }
 
   cancelScheduledCheck(document.uri);
-  invalidate(document.uri);
+  const generation = invalidate(document.uri);
   diagnostics.delete(document.uri);
   formattingHovers.delete(document.uri.toString());
 
   const executable = selectExecutable(document, context.root);
   const extraArguments = setting(document, "extraArguments", []);
+  const args = [...extraArguments, "-i", document.uri.fsPath];
   const result = await runFourmolu(
     executable,
-    [...extraArguments, "-i", document.uri.fsPath],
+    args,
     context.root,
   );
 
-  if (!result.started || result.exitCode !== 0) {
-    reportToolFailure(context.root, executable, result);
+  if (!isCurrent(document.uri, generation)) {
+    return;
+  }
+  if (!result.started) {
+    reportExecutionFailure(document, context, executable, args, result);
+    return;
+  }
+  reportedToolFailures.delete(context.root);
+  if (result.exitCode !== 0) {
+    reportFourmoluFailure(document, context, executable, args, result, "format");
     return;
   }
 
-  reportedToolFailures.delete(context.root);
   scheduleCheck(document);
 }
 
@@ -234,6 +255,7 @@ async function targetDocument(uri) {
 }
 
 async function checkDocument(document) {
+  const generation = invalidate(document.uri);
   const context = workspaceContext(document);
   if (!context || document.isDirty) {
     diagnostics.delete(document.uri);
@@ -241,12 +263,12 @@ async function checkDocument(document) {
     return;
   }
 
-  const generation = invalidate(document.uri);
   const executable = selectExecutable(document, context.root);
   const extraArguments = setting(document, "extraArguments", []);
+  const checkArgs = [...extraArguments, "-m", "check", "-q", document.uri.fsPath];
   const check = await runFourmolu(
     executable,
-    [...extraArguments, "-m", "check", "-q", document.uri.fsPath],
+    checkArgs,
     context.root,
   );
 
@@ -254,11 +276,10 @@ async function checkDocument(document) {
     return;
   }
   if (!check.started) {
-    diagnostics.delete(document.uri);
-    formattingHovers.delete(document.uri.toString());
-    reportToolFailure(context.root, executable, check);
+    reportExecutionFailure(document, context, executable, checkArgs, check);
     return;
   }
+  reportedToolFailures.delete(context.root);
   if (check.exitCode === 0) {
     diagnostics.delete(document.uri);
     formattingHovers.delete(document.uri.toString());
@@ -269,42 +290,41 @@ async function checkDocument(document) {
   // A check-mode failure can mean either bad formatting or a parser/tool
   // error. Formatting to stdout lets us distinguish those without touching
   // the file; this second process only runs when the CI-equivalent check fails.
-  const probe = await runFourmolu(
-    executable,
-    [...extraArguments, document.uri.fsPath],
-    context.root,
-  );
+  const probeArgs = [...extraArguments, document.uri.fsPath];
+  const probe = await runFourmolu(executable, probeArgs, context.root);
   if (!isCurrent(document.uri, generation)) {
     return;
   }
   if (!probe.started) {
-    diagnostics.delete(document.uri);
-    formattingHovers.delete(document.uri.toString());
-    reportToolFailure(context.root, executable, probe);
+    reportExecutionFailure(document, context, executable, probeArgs, probe);
     return;
   }
 
   if (probe.exitCode === 0) {
+    if (!hasFormattedOutput(document, probe.stdout)) {
+      reportMalformedOutput(document, context, executable, probeArgs, probe);
+      return;
+    }
     setFormattingDiagnostics(document, probe.stdout);
     reportedToolFailures.delete(context.root);
     return;
   }
 
-  const detail = summarizeOutput(probe.output || check.output);
-  setDiagnostic(
+  reportFourmoluFailure(
     document,
-    detail
-      ? `Fourmolu could not check this file: ${detail}`
-      : "Fourmolu could not check this file. See the Fourmolu Warning output.",
-    "check-failed",
+    context,
+    executable,
+    probeArgs,
+    probe,
+    "check",
+    check,
   );
-  writeFailure(executable, context.root, probe);
 }
 
 function workspaceContext(document) {
   if (
     !setting(document, "enabled", true) ||
-    document.uri.scheme !== "file" ||
+    !supportsExecutableFile(document) ||
     path.extname(document.uri.fsPath) !== ".hs"
   ) {
     return undefined;
@@ -312,7 +332,7 @@ function workspaceContext(document) {
 
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
   const root = folder ? folder.uri.fsPath : path.dirname(document.uri.fsPath);
-  const globBase = folder || root;
+  const globBase = folder || standaloneGlobBase(document, root);
 
   const includes = setting(document, "include", ["**/*.hs"]);
   const excludes = setting(document, "exclude", [
@@ -321,7 +341,10 @@ function workspaceContext(document) {
   ]);
   const matches = (pattern) =>
     vscode.languages.match(
-      { scheme: "file", pattern: new vscode.RelativePattern(globBase, pattern) },
+      {
+        scheme: document.uri.scheme,
+        pattern: new vscode.RelativePattern(globBase, pattern),
+      },
       document,
     ) > 0;
 
@@ -329,19 +352,34 @@ function workspaceContext(document) {
     return undefined;
   }
 
-  return { root };
+  return { root, workspaceFolder: folder?.uri.fsPath };
+}
+
+function supportsExecutableFile(document) {
+  return document.uri.scheme === "file" || document.uri.scheme === "vscode-remote";
+}
+
+function standaloneGlobBase(document, root) {
+  if (document.uri.scheme === "file") {
+    return root;
+  }
+  return document.uri.with({ path: path.posix.dirname(document.uri.path) });
 }
 
 function selectExecutable(document, root) {
   const configured =
     String(setting(document, "executablePath", "fourmolu")).trim() ||
     "fourmolu";
+  return resolveExecutable(configured, root);
+}
+
+function resolveExecutable(configured, root, pathApi = path) {
   const expanded = configured.replaceAll("${workspaceFolder}", root);
-  if (path.isAbsolute(expanded)) {
+  if (pathApi.isAbsolute(expanded)) {
     return expanded;
   }
   return expanded.includes("/") || expanded.includes("\\")
-    ? path.resolve(root, expanded)
+    ? pathApi.resolve(root, expanded)
     : expanded;
 }
 
@@ -352,14 +390,14 @@ function runFourmolu(executable, args, cwd) {
       args,
       { cwd, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true },
       (error, stdout, stderr) => {
-        const stdoutText = stdout || "";
-        const outputText = `${stdoutText}${stderr || ""}`.trim();
+        const stdoutText = String(stdout || "");
+        const stderrText = String(stderr || "");
         if (!error) {
           resolve({
             started: true,
             exitCode: 0,
-            output: outputText,
             stdout: stdoutText,
+            stderr: stderrText,
           });
           return;
         }
@@ -368,8 +406,9 @@ function runFourmolu(executable, args, cwd) {
           resolve({
             started: true,
             exitCode: error.code,
-            output: outputText || error.message,
             stdout: stdoutText,
+            stderr: stderrText,
+            errorMessage: error.message,
           });
           return;
         }
@@ -377,8 +416,10 @@ function runFourmolu(executable, args, cwd) {
         resolve({
           started: false,
           exitCode: undefined,
-          output: outputText || error.message,
           stdout: stdoutText,
+          stderr: stderrText,
+          errorCode: error.code,
+          errorMessage: error.message,
         });
       },
     );
@@ -413,6 +454,7 @@ function setFormattingDiagnostics(document, formattedText) {
       message: formattingMessage(kind),
     };
   });
+  const severity = formattingDiagnosticSeverity(document);
   formattingHovers.set(document.uri.toString(), entries);
   diagnostics.set(
     document.uri,
@@ -422,6 +464,7 @@ function setFormattingDiagnostics(document, formattedText) {
         entry.range,
         entry.message,
         "unformatted",
+        severity,
       ),
     ),
   );
@@ -431,11 +474,23 @@ function formattingMessage(kind) {
   return FORMATTING_MESSAGES[kind] || FORMATTING_MESSAGES.generic;
 }
 
+function formattingDiagnosticSeverity(document) {
+  return String(setting(document, "diagnosticSeverity", "warning")).toLowerCase() ===
+    "information"
+    ? vscode.DiagnosticSeverity.Information
+    : vscode.DiagnosticSeverity.Warning;
+}
+
 function isCommentOutput(value) {
   return /^\s*(?:--|\{-(?!#))/.test(value);
 }
 
-function setDiagnostic(document, message, code) {
+function setDiagnostic(
+  document,
+  message,
+  code,
+  severity = vscode.DiagnosticSeverity.Error,
+) {
   formattingHovers.delete(document.uri.toString());
   const range = new vscode.Range(
     0,
@@ -445,18 +500,24 @@ function setDiagnostic(document, message, code) {
   );
   diagnostics.set(
     document.uri,
-    [createDiagnostic(document, range, message, code)],
+    [createDiagnostic(document, range, message, code, severity)],
   );
 }
 
-function createDiagnostic(document, rangeOrBlock, message, code) {
+function createDiagnostic(
+  document,
+  rangeOrBlock,
+  message,
+  code,
+  severity = vscode.DiagnosticSeverity.Warning,
+) {
   const range = rangeOrBlock instanceof vscode.Range
     ? rangeOrBlock
     : diagnosticRange(document, rangeOrBlock);
   const diagnostic = new vscode.Diagnostic(
     range,
     message,
-    vscode.DiagnosticSeverity.Warning,
+    severity,
   );
   diagnostic.source = SOURCE;
   diagnostic.code = code;
@@ -878,34 +939,123 @@ function backtrackLineDiff(trace, before, after, distance) {
   return operations.reverse();
 }
 
-function reportToolFailure(root, executable, result) {
-  const detail = summarizeOutput(result.output) || "unknown execution error";
-  const message = `Could not run ${executable}: ${detail}`;
-  writeFailure(executable, root, result);
+function hasFormattedOutput(document, stdout) {
+  const sourceText = document.getText();
+  const formattedText = String(stdout);
+  return (
+    formattedText !== sourceText &&
+    (sourceText.trim() === "" || formattedText.trim() !== "")
+  );
+}
 
-  if (reportedToolFailures.get(root) === message) {
+function reportExecutionFailure(document, context, executable, args, result) {
+  const message = executionFailureMessage(executable, result);
+  setDiagnostic(document, message, "execution-failed");
+
+  if (reportedToolFailures.get(context.root) === message) {
     return;
   }
-  reportedToolFailures.set(root, message);
-  void vscode.window.showWarningMessage(
-    "Fourmolu Warning could not run Fourmolu. Open its output for details.",
-    "Show Output",
-  ).then((choice) => {
-    if (choice === "Show Output") {
+  reportedToolFailures.set(context.root, message);
+  writeFailure(document, context, executable, args, result, "execution");
+
+  const notification = isMissingExecutable(result)
+    ? `Fourmolu executable was not found: ${executable}. Install Fourmolu in the environment where VS Code is running, or verify workspace access.`
+    : `Fourmolu Checker could not start ${executable}. Open its output for details.`;
+  void vscode.window.showWarningMessage(notification, "Show Output").then((choice) => {
+    if (active && choice === "Show Output") {
       output.show(true);
     }
   });
 }
 
-function writeFailure(executable, root, result) {
-  output.appendLine(`[${new Date().toISOString()}] Fourmolu failed`);
-  output.appendLine(`cwd: ${root}`);
+function executionFailureMessage(executable, result) {
+  if (isMissingExecutable(result)) {
+    return `Fourmolu executable was not found: ${executable}. Install Fourmolu in the environment where VS Code is running (local, Remote SSH, WSL, or devcontainer), or configure fourmoluChecker.executablePath. If it is already installed, verify that the workspace directory is available to the extension host.`;
+  }
+  if (result.errorCode === "EACCES") {
+    return `Fourmolu executable is not executable: ${executable}. Check its permissions and fourmoluChecker.executablePath.`;
+  }
+
+  const detail = summarizeOutput(result.stderr || result.errorMessage);
+  return detail
+    ? `Could not start Fourmolu (${executable}): ${detail}`
+    : `Could not start Fourmolu (${executable}). See the Fourmolu Checker output.`;
+}
+
+function isMissingExecutable(result) {
+  return result.errorCode === "ENOENT" || /\bENOENT\b/.test(result.errorMessage || "");
+}
+
+function reportFourmoluFailure(
+  document,
+  context,
+  executable,
+  args,
+  result,
+  operation,
+  fallbackResult,
+) {
+  const resultWithDetail = result.stderr
+    ? result
+    : {
+      ...result,
+      stderr: fallbackResult?.stderr || "",
+      errorMessage: result.errorMessage || fallbackResult?.errorMessage,
+    };
+  const detail = summarizeOutput(
+    resultWithDetail.stderr || resultWithDetail.errorMessage,
+  );
+  setDiagnostic(
+    document,
+    detail
+      ? `Fourmolu ${operation} failed: ${detail}`
+      : `Fourmolu ${operation} failed. See the Fourmolu Checker output.`,
+    "check-failed",
+  );
+  writeFailure(document, context, executable, args, resultWithDetail, operation);
+}
+
+function reportMalformedOutput(document, context, executable, args, result) {
+  setDiagnostic(
+    document,
+    "Fourmolu returned unexpected formatted output. See the Fourmolu Checker output.",
+    "invalid-output",
+  );
+  writeFailure(
+    document,
+    context,
+    executable,
+    args,
+    { ...result, errorMessage: "No formatted output was returned." },
+    "output validation",
+  );
+}
+
+function writeFailure(document, context, executable, args, result, operation) {
+  output.appendLine(`[${new Date().toISOString()}] Fourmolu ${operation} failed`);
+  output.appendLine(`file: ${document.uri.fsPath}`);
+  output.appendLine(`workspace folder: ${context.workspaceFolder || "(standalone file)"}`);
+  output.appendLine(`cwd: ${context.root}`);
   output.appendLine(`executable: ${executable}`);
+  output.appendLine(`arguments: ${JSON.stringify(args)}`);
   output.appendLine(`exit code: ${result.exitCode ?? "not started"}`);
-  if (result.output) {
-    output.appendLine(result.output);
+  if (result.errorCode) {
+    output.appendLine(`error code: ${result.errorCode}`);
+  }
+  const stderr = truncateLog(result.stderr);
+  if (stderr) {
+    output.appendLine(`stderr: ${stderr}`);
+  } else if (result.errorMessage) {
+    output.appendLine(`error: ${truncateLog(result.errorMessage)}`);
   }
   output.appendLine("");
+}
+
+function truncateLog(value) {
+  const text = String(value || "").trim();
+  return text.length > MAX_LOG_BYTES
+    ? `${text.slice(0, MAX_LOG_BYTES)}…`
+    : text;
 }
 
 function summarizeOutput(value) {
@@ -915,4 +1065,4 @@ function summarizeOutput(value) {
     .slice(0, 240);
 }
 
-module.exports = { activate, deactivate };
+module.exports = { activate, deactivate, resolveExecutable };

@@ -1,8 +1,8 @@
 {
-  "name": "fourmolu-warning",
-  "displayName": "Fourmolu Warning",
-  "description": "Reports Haskell files that do not pass the Fourmolu check.",
-  "version": "0.3.1",
+  "name": "fourmolu-checker",
+  "displayName": "Fourmolu Checker - Formatting Diagnostics for Haskell",
+  "description": "Displays Fourmolu formatting differences as VS Code diagnostics without modifying your source files.",
+  "version": "0.4.0",
   "publisher": "hugoduda",
   "author": {
     "name": "Hugo Duda"
@@ -11,12 +11,12 @@
   "icon": "images/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HugoDuda/fourmolu-warning.git"
+    "url": "https://github.com/HugoDuda/fourmolu-checker.git"
   },
   "bugs": {
-    "url": "https://github.com/HugoDuda/fourmolu-warning/issues"
+    "url": "https://github.com/HugoDuda/fourmolu-checker/issues"
   },
-  "homepage": "https://github.com/HugoDuda/fourmolu-warning#readme",
+  "homepage": "https://github.com/HugoDuda/fourmolu-checker#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -40,8 +40,8 @@
   ],
   "activationEvents": [
     "onLanguage:haskell",
-    "onCommand:fourmoluWarning.checkCurrentFile",
-    "onCommand:fourmoluWarning.formatCurrentFile"
+    "onCommand:fourmoluChecker.checkCurrentFile",
+    "onCommand:fourmoluChecker.formatCurrentFile"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -51,36 +51,46 @@
   "contributes": {
     "commands": [
       {
-        "command": "fourmoluWarning.checkCurrentFile",
-        "title": "Fourmolu: Check Current File"
+        "command": "fourmoluChecker.checkCurrentFile",
+        "title": "Fourmolu Checker: Check Current File"
       },
       {
-        "command": "fourmoluWarning.formatCurrentFile",
-        "title": "Fourmolu: Format Current File"
+        "command": "fourmoluChecker.formatCurrentFile",
+        "title": "Fourmolu Checker: Format Current File"
       }
     ],
     "configuration": {
-      "title": "Fourmolu Warning",
+      "title": "Fourmolu Checker",
       "properties": {
-        "fourmoluWarning.enabled": {
+        "fourmoluChecker.enabled": {
           "type": "boolean",
           "default": true,
           "scope": "resource",
           "description": "Enable Fourmolu formatting diagnostics."
         },
-        "fourmoluWarning.checkOnSave": {
+        "fourmoluChecker.checkOnSave": {
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "Check matching Haskell files after they are saved."
+          "description": "Check matching Haskell files after they are saved and when a clean file is opened."
         },
-        "fourmoluWarning.executablePath": {
+        "fourmoluChecker.diagnosticSeverity": {
+          "type": "string",
+          "enum": [
+            "warning",
+            "information"
+          ],
+          "default": "warning",
+          "scope": "resource",
+          "description": "Severity used for Fourmolu formatting diagnostics. Execution and Fourmolu failures are always reported as errors."
+        },
+        "fourmoluChecker.executablePath": {
           "type": "string",
           "default": "fourmolu",
           "scope": "resource",
-          "description": "Fourmolu executable name or path. Relative paths are resolved from the workspace folder."
+          "description": "Fourmolu executable name or path. Relative paths are resolved from the owning workspace folder, or from the standalone file's directory."
         },
-        "fourmoluWarning.include": {
+        "fourmoluChecker.include": {
           "type": "array",
           "items": {
             "type": "string"
@@ -91,7 +101,7 @@
           "scope": "resource",
           "description": "Glob patterns, relative to each workspace folder, for files to check."
         },
-        "fourmoluWarning.exclude": {
+        "fourmoluChecker.exclude": {
           "type": "array",
           "items": {
             "type": "string"
@@ -103,7 +113,7 @@
           "scope": "resource",
           "description": "Glob patterns, relative to each workspace folder, for files to ignore."
         },
-        "fourmoluWarning.extraArguments": {
+        "fourmoluChecker.extraArguments": {
           "type": "array",
           "items": {
             "type": "string"

@@ -12,19 +12,29 @@ const commands = new Map();
 const diagnosticsByUri = new Map();
 const executions = [];
 const settings = new Map();
+const resourceSettings = new Map();
+const outputLines = [];
+const warningMessages = [];
+const deferredExecutions = [];
 let workspaceFolders;
 let processBehavior = () => ({ exitCode: 0, stdout: "", stderr: "" });
 let quickFixProvider;
 let hoverProvider;
+let outputChannelName;
 
 class Uri {
-  constructor(fsPath) {
+  constructor(fsPath, scheme = "file") {
     this.fsPath = fsPath;
-    this.scheme = "file";
+    this.scheme = scheme;
+    this.path = fsPath.split(path.sep).join("/");
   }
 
   toString() {
-    return `file://${this.fsPath}`;
+    return `${this.scheme}://${this.fsPath}`;
+  }
+
+  with(changes) {
+    return new Uri(changes.path ?? this.fsPath, changes.scheme ?? this.scheme);
   }
 }
 
@@ -47,7 +57,7 @@ class CodeAction {
 
 class RelativePattern {
   constructor(base, pattern) {
-    this.baseUri = typeof base === "string" ? new Uri(base) : base.uri;
+    this.baseUri = typeof base === "string" ? new Uri(base) : base.uri || base;
     this.pattern = pattern;
   }
 }
@@ -99,7 +109,7 @@ const vscode = {
   CodeAction,
   CodeActionKind: { QuickFix: "quickfix" },
   Diagnostic,
-  DiagnosticSeverity: { Warning: 1 },
+  DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
   Hover,
   MarkdownString,
   Position,
@@ -115,6 +125,9 @@ const vscode = {
   languages: {
     createDiagnosticCollection: () => diagnosticCollection,
     match(selector, document) {
+      if (selector.scheme && selector.scheme !== document.uri.scheme) {
+        return 0;
+      }
       const relativePath = path
         .relative(selector.pattern.baseUri.fsPath, document.uri.fsPath)
         .split(path.sep)
@@ -132,20 +145,35 @@ const vscode = {
   },
   window: {
     activeTextEditor: undefined,
-    createOutputChannel: () => ({
-      appendLine() {},
-      dispose() {},
-      show() {},
-    }),
-    showWarningMessage: async () => undefined,
+    createOutputChannel: (name) => {
+      outputChannelName = name;
+      return {
+        appendLine(line) {
+          outputLines.push(line);
+        },
+        dispose() {},
+        show() {},
+      };
+    },
+    showWarningMessage(message, ...items) {
+      warningMessages.push({ message, items });
+      return Promise.resolve(undefined);
+    },
   },
   workspace: {
-    getConfiguration: () => ({
+    getConfiguration: (_section, resource) => ({
       get: (name, fallback) =>
-        settings.has(name) ? settings.get(name) : fallback,
+        resourceSettings.has(resourceSettingKey(resource, name))
+          ? resourceSettings.get(resourceSettingKey(resource, name))
+          : settings.has(name)
+            ? settings.get(name)
+            : fallback,
     }),
     getWorkspaceFolder(uri) {
       return workspaceFolders.find((folder) => {
+        if (folder.uri.scheme !== uri.scheme) {
+          return false;
+        }
         const relativePath = path.relative(folder.uri.fsPath, uri.fsPath);
         return relativePath === "" || !relativePath.startsWith("..");
       });
@@ -170,7 +198,7 @@ const vscode = {
       callbacks.save = callback;
       return { dispose() {} };
     },
-    openTextDocument: async (uri) => makeDocument(uri.fsPath),
+    openTextDocument: async (uri) => makeDocument(uri.fsPath, undefined, uri.scheme),
     textDocuments: [],
   },
 };
@@ -187,11 +215,13 @@ before(async () => {
   };
   childProcess.execFile = (executable, args, options, callback) => {
     executions.push({ executable, args, options });
-    const result = processBehavior(args);
-    const error = result.exitCode === 0
-      ? null
-      : Object.assign(new Error("Fourmolu failed"), { code: result.exitCode });
-    setImmediate(() => callback(error, result.stdout, result.stderr));
+    const result = processBehavior(args, executable, options);
+    if (result.defer) {
+      deferredExecutions.push({ callback });
+      return { kill() {} };
+    }
+    setImmediate(() => completeProcess(callback, result));
+    return { kill() {} };
   };
 
   const startupDocument = makeDocument(
@@ -270,7 +300,7 @@ test("reports any unformatted .hs file and offers a quick fix", async () => {
     diagnostics: [diagnostic],
   });
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].command.command, "fourmoluWarning.formatCurrentFile");
+  assert.equal(actions[0].command.command, "fourmoluChecker.formatCurrentFile");
 
   callbacks.change({ document });
   assert.equal(
@@ -620,7 +650,7 @@ test("uses the workspace folder containing the file in a multi-root workspace", 
 test("uses the saved file's directory outside a workspace", async () => {
   reset();
   workspaceFolders = [];
-  const document = makeDocument("/tmp/fourmolu-warning-fixture/Standalone.hs");
+  const document = makeDocument("/tmp/fourmolu-checker-fixture/Standalone.hs");
 
   callbacks.save(document);
   await waitForCheck();
@@ -628,11 +658,406 @@ test("uses the saved file's directory outside a workspace", async () => {
   assert.equal(executions.length, 1);
   assert.equal(
     executions[0].options.cwd,
-    "/tmp/fourmolu-warning-fixture",
+    "/tmp/fourmolu-checker-fixture",
   );
 });
 
-function makeDocument(filePath, text = "module Example where\n") {
+test("resolves a standalone relative executable from the file directory", async () => {
+  reset();
+  workspaceFolders = [];
+  settings.set("executablePath", "${workspaceFolder}/tools/fourmolu");
+  const document = makeDocument(
+    "/tmp/fourmolu-checker-fixture/Standalone With Spaces.hs",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  assert.equal(executions.length, 1);
+  assert.equal(
+    executions[0].executable,
+    "/tmp/fourmolu-checker-fixture/tools/fourmolu",
+  );
+  assert.equal(executions[0].options.cwd, "/tmp/fourmolu-checker-fixture");
+});
+
+test("resolves Windows executable paths without shell interpolation", () => {
+  const { resolveExecutable } = require("../extension");
+  const root = "C:\\workspace with spaces";
+
+  assert.equal(
+    resolveExecutable("tools\\fourmolu.exe", root, path.win32),
+    "C:\\workspace with spaces\\tools\\fourmolu.exe",
+  );
+  assert.equal(
+    resolveExecutable("${workspaceFolder}\\bin\\fourmolu.exe", root, path.win32),
+    "C:\\workspace with spaces\\bin\\fourmolu.exe",
+  );
+  assert.equal(
+    resolveExecutable("C:\\Tools\\fourmolu.exe", root, path.win32),
+    "C:\\Tools\\fourmolu.exe",
+  );
+});
+
+test("uses absolute executable paths and file paths containing spaces", async () => {
+  reset();
+  const root = path.join("/tmp", "Fourmolu Workspace");
+  const executable = path.join("/opt", "Fourmolu Tools", "fourmolu");
+  workspaceFolders = [makeWorkspaceFolder(root)];
+  settings.set("executablePath", executable);
+  const document = makeDocument(
+    path.join(root, "src", "File With Spaces.hs"),
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  assert.equal(executions.length, 1);
+  assert.equal(executions[0].executable, executable);
+  assert.equal(executions[0].options.cwd, root);
+  assert.equal(executions[0].args.at(-1), document.uri.fsPath);
+});
+
+test("resolves relative executables and workspaceFolder per workspace folder", async () => {
+  reset();
+  const firstRoot = path.join("/tmp", "first Fourmolu workspace");
+  const secondRoot = path.join("/tmp", "second Fourmolu workspace");
+  workspaceFolders = [
+    makeWorkspaceFolder(firstRoot),
+    makeWorkspaceFolder(secondRoot),
+  ];
+  const firstDocument = makeDocument(path.join(firstRoot, "src", "First.hs"));
+  const secondDocument = makeDocument(path.join(secondRoot, "src", "Second.hs"));
+  setResourceSetting(
+    firstDocument,
+    "executablePath",
+    "${workspaceFolder}/tools/first-fourmolu",
+  );
+  setResourceSetting(secondDocument, "executablePath", "tools/second-fourmolu");
+
+  callbacks.save(firstDocument);
+  await waitForCheck();
+  callbacks.save(secondDocument);
+  await waitForCheck();
+
+  assert.equal(executions.length, 2);
+  assert.equal(
+    executions[0].executable,
+    path.join(firstRoot, "tools", "first-fourmolu"),
+  );
+  assert.equal(
+    executions[1].executable,
+    path.join(secondRoot, "tools", "second-fourmolu"),
+  );
+  assert.equal(executions[0].options.cwd, firstRoot);
+  assert.equal(executions[1].options.cwd, secondRoot);
+});
+
+test("checks vscode-remote files in their remote workspace folder", async () => {
+  reset();
+  const remoteRoot = "/home/dev/fourmolu-project";
+  workspaceFolders = [makeWorkspaceFolder(remoteRoot, "vscode-remote")];
+  const document = makeDocument(
+    `${remoteRoot}/src/Remote.hs`,
+    "module Remote where\n",
+    "vscode-remote",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  assert.equal(executions.length, 1);
+  assert.equal(executions[0].executable, "fourmolu");
+  assert.equal(executions[0].options.cwd, remoteRoot);
+});
+
+test("reports a missing executable once with an execution diagnostic and output context", async () => {
+  reset();
+  settings.set("executablePath", "tools/missing-fourmolu");
+  processBehavior = () => ({
+    errorCode: "ENOENT",
+    errorMessage: "spawn tools/missing-fourmolu ENOENT",
+    stdout: "module Secret where",
+    stderr: "",
+  });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "MissingExecutable.hs"),
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  const [diagnostic] = diagnosticsByUri.get(document.uri.toString());
+  assert.equal(diagnostic.code, "execution-failed");
+  assert.equal(diagnostic.severity, vscode.DiagnosticSeverity.Error);
+  assert.match(diagnostic.message, /executable was not found/);
+  assert.match(diagnostic.message, /Remote SSH, WSL, or devcontainer/);
+  assert.match(
+    diagnostic.message,
+    new RegExp(path.join(workspaceRoot, "tools", "missing-fourmolu")),
+  );
+  assert.equal(warningMessages.length, 1);
+  assert.match(warningMessages[0].message, /executable was not found/);
+  assert.equal(outputChannelName, "Fourmolu Checker");
+  assert.match(outputLines.join("\n"), new RegExp(`file: ${document.uri.fsPath}`));
+  assert.match(outputLines.join("\n"), /workspace folder:/);
+  assert.match(outputLines.join("\n"), /arguments:/);
+  assert.match(outputLines.join("\n"), /error code: ENOENT/);
+  assert.equal(outputLines.join("\n").includes("module Secret where"), false);
+
+  const firstLogLength = outputLines.length;
+  callbacks.save(document);
+  await waitForCheck();
+  assert.equal(warningMessages.length, 1);
+  assert.equal(outputLines.length, firstLogLength);
+});
+
+test("classifies permission and Fourmolu parser failures as errors", async () => {
+  reset();
+  processBehavior = () => ({
+    errorCode: "EACCES",
+    errorMessage: "spawn fourmolu EACCES",
+    stdout: "",
+    stderr: "",
+  });
+  const permissionDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "Permission.hs"),
+  );
+
+  callbacks.save(permissionDocument);
+  await waitForCheck();
+
+  let [diagnostic] = diagnosticsByUri.get(permissionDocument.uri.toString());
+  assert.equal(diagnostic.code, "execution-failed");
+  assert.equal(diagnostic.severity, vscode.DiagnosticSeverity.Error);
+  assert.match(diagnostic.message, /not executable/);
+
+  reset();
+  processBehavior = (args) => ({
+    exitCode: 1,
+    stdout: "",
+    stderr: args.includes("check") ? "Parser error in input" : "",
+  });
+  const parserDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "ParserFailure.hs"),
+  );
+
+  callbacks.save(parserDocument);
+  await waitForCheck();
+
+  [diagnostic] = diagnosticsByUri.get(parserDocument.uri.toString());
+  assert.equal(diagnostic.code, "check-failed");
+  assert.equal(diagnostic.severity, vscode.DiagnosticSeverity.Error);
+  assert.match(diagnostic.message, /Parser error in input/);
+  assert.match(outputLines.join("\n"), /stderr: Parser error in input/);
+});
+
+test("reports malformed formatted output instead of a formatting diagnostic", async () => {
+  reset();
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: "",
+    stderr: "",
+  });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "MalformedOutput.hs"),
+    "module Example where\nvalue = 1\n",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+
+  const [diagnostic] = diagnosticsByUri.get(document.uri.toString());
+  assert.equal(diagnostic.code, "invalid-output");
+  assert.equal(diagnostic.severity, vscode.DiagnosticSeverity.Error);
+
+  reset();
+  const source = "module Example where\nvalue = 1\n";
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: args.includes("check") ? "" : source,
+    stderr: "",
+  });
+  const unchangedDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "UnchangedOutput.hs"),
+    source,
+  );
+
+  callbacks.save(unchangedDocument);
+  await waitForCheck();
+
+  assert.equal(
+    diagnosticsByUri.get(unchangedDocument.uri.toString())[0].code,
+    "invalid-output",
+  );
+});
+
+test("uses configured formatting severity and falls back to warning", async () => {
+  reset();
+  settings.set("diagnosticSeverity", "information");
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: args.includes("check") ? "" : "module Example where\nvalue = 1\n",
+    stderr: "",
+  });
+  const informationDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "Information.hs"),
+    "module Example where\nvalue=1\n",
+  );
+
+  callbacks.save(informationDocument);
+  await waitForCheck();
+
+  assert.equal(
+    diagnosticsByUri.get(informationDocument.uri.toString())[0].severity,
+    vscode.DiagnosticSeverity.Information,
+  );
+
+  reset();
+  settings.set("diagnosticSeverity", "invalid-value");
+  processBehavior = (args) => ({
+    exitCode: args.includes("check") ? 1 : 0,
+    stdout: args.includes("check") ? "" : "module Example where\nvalue = 1\n",
+    stderr: "",
+  });
+  const fallbackDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "SeverityFallback.hs"),
+    "module Example where\nvalue=1\n",
+  );
+
+  callbacks.save(fallbackDocument);
+  await waitForCheck();
+
+  assert.equal(
+    diagnosticsByUri.get(fallbackDocument.uri.toString())[0].severity,
+    vscode.DiagnosticSeverity.Warning,
+  );
+});
+
+test("clears stale diagnostics when checking is disabled or a file becomes excluded", async () => {
+  reset();
+  const disabledDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "Disabled.hs"),
+  );
+  diagnosticsByUri.set(disabledDocument.uri.toString(), [{ code: "unformatted" }]);
+  settings.set("enabled", false);
+
+  callbacks.save(disabledDocument);
+  await waitForCheck();
+
+  assert.equal(executions.length, 0);
+  assert.equal(diagnosticsByUri.has(disabledDocument.uri.toString()), false);
+
+  reset();
+  const excludedDocument = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "Excluded.hs"),
+  );
+  diagnosticsByUri.set(excludedDocument.uri.toString(), [{ code: "unformatted" }]);
+  settings.set("exclude", ["**/*.hs"]);
+
+  callbacks.save(excludedDocument);
+  await waitForCheck();
+
+  assert.equal(executions.length, 0);
+  assert.equal(diagnosticsByUri.has(excludedDocument.uri.toString()), false);
+});
+
+test("invalidates an in-flight check after a relevant configuration change", async () => {
+  reset();
+  processBehavior = () => ({ defer: true });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "ConfigurationRace.hs"),
+    "module Example where\nvalue=1\n",
+  );
+  vscode.workspace.textDocuments = [document];
+
+  callbacks.save(document);
+  await waitForCheck();
+  assert.equal(executions.length, 1);
+
+  settings.set("enabled", false);
+  callbacks.changeConfiguration({
+    affectsConfiguration: (name) => name === "fourmoluChecker",
+  });
+  completeDeferredExecution(0, { exitCode: 1, stdout: "", stderr: "" });
+  await flushProcess();
+  await waitForCheck();
+
+  assert.equal(diagnosticsByUri.has(document.uri.toString()), false);
+  assert.equal(executions.length, 1);
+});
+
+test("keeps a newer diagnostic when an older execution finishes later", async () => {
+  reset();
+  processBehavior = () => ({ defer: true });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "StaleExecution.hs"),
+    "module Example where\nvalue=1\n",
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+  assert.equal(executions.length, 1);
+
+  callbacks.change({ document });
+  callbacks.save(document);
+  await waitForCheck();
+  assert.equal(executions.length, 2);
+
+  completeDeferredExecution(1, { exitCode: 1, stdout: "", stderr: "" });
+  await flushProcess();
+  assert.equal(executions.length, 3);
+  completeDeferredExecution(2, {
+    exitCode: 0,
+    stdout: "module Example where\nvalue = 1\n",
+    stderr: "",
+  });
+  await flushProcess();
+  assert.equal(
+    diagnosticsByUri.get(document.uri.toString())[0].code,
+    "unformatted",
+  );
+
+  completeDeferredExecution(0, { exitCode: 0, stdout: "", stderr: "" });
+  await flushProcess();
+  assert.equal(
+    diagnosticsByUri.get(document.uri.toString())[0].code,
+    "unformatted",
+  );
+});
+
+test("clears diagnostics and ignores checks after closing a document", async () => {
+  reset();
+  processBehavior = () => ({ defer: true });
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "Closed.hs"),
+  );
+
+  callbacks.save(document);
+  await waitForCheck();
+  diagnosticsByUri.set(document.uri.toString(), [{ code: "unformatted" }]);
+  callbacks.close(document);
+  completeDeferredExecution(0, { exitCode: 0, stdout: "", stderr: "" });
+  await flushProcess();
+
+  assert.equal(diagnosticsByUri.has(document.uri.toString()), false);
+});
+
+test("does not run automatic checks when checkOnSave is disabled", async () => {
+  reset();
+  settings.set("checkOnSave", false);
+  const document = makeDocument(
+    path.join(workspaceRoot, "src", "Example", "CheckOnSaveDisabled.hs"),
+  );
+
+  callbacks.open(document);
+  callbacks.save(document);
+  await waitForCheck();
+
+  assert.equal(executions.length, 0);
+});
+
+function makeDocument(filePath, text = "module Example where\n", scheme = "file") {
   const lines = text.split("\n");
   return {
     isDirty: false,
@@ -640,7 +1065,7 @@ function makeDocument(filePath, text = "module Example where\n") {
     lineAt: (line) => ({ text: lines[line] }),
     lineCount: lines.length,
     save: async () => true,
-    uri: new Uri(filePath),
+    uri: new Uri(filePath, scheme),
   };
 }
 
@@ -648,15 +1073,51 @@ function reset() {
   executions.length = 0;
   diagnosticsByUri.clear();
   settings.clear();
+  resourceSettings.clear();
+  outputLines.length = 0;
+  warningMessages.length = 0;
+  deferredExecutions.length = 0;
+  processBehavior = () => ({ exitCode: 0, stdout: "", stderr: "" });
   workspaceFolders = [makeWorkspaceFolder(workspaceRoot)];
+  vscode.workspace.textDocuments = [];
+  vscode.window.activeTextEditor = undefined;
 }
 
 function waitForCheck() {
   return new Promise((resolve) => setTimeout(resolve, 325));
 }
 
-function makeWorkspaceFolder(root) {
-  return { uri: new Uri(root) };
+function makeWorkspaceFolder(root, scheme = "file") {
+  return { uri: new Uri(root, scheme) };
+}
+
+function setResourceSetting(document, name, value) {
+  resourceSettings.set(resourceSettingKey(document.uri, name), value);
+}
+
+function resourceSettingKey(resource, name) {
+  return `${resource?.toString() || "global"}\u0000${name}`;
+}
+
+function completeProcess(callback, result) {
+  const failed = result.errorCode || result.exitCode !== 0;
+  const error = failed
+    ? Object.assign(
+      new Error(result.errorMessage || "Fourmolu failed"),
+      { code: result.errorCode ?? result.exitCode },
+    )
+    : null;
+  callback(error, result.stdout || "", result.stderr || "");
+}
+
+function completeDeferredExecution(index, result) {
+  const execution = deferredExecutions[index];
+  assert.ok(execution, `missing deferred execution ${index}`);
+  completeProcess(execution.callback, result);
+}
+
+function flushProcess() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function rangeFields(range) {

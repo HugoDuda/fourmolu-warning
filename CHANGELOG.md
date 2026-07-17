@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- rename the extension to Fourmolu Checker;
+- harden executable resolution, remote workspace support and stale-result handling;
+- add configurable formatting diagnostic severity and execution troubleshooting output.
+
 ## 0.3.1
 
 - Update README.md to reflect the new version of Fourmolu.
